@@ -2,31 +2,25 @@ from fastapi import FastAPI, Request
 import openai
 import os
 import json
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# Set your API key
-openai.api_key = os.getenv("OPENAI_API_KEY")  # Set in Render dashboard or .env
-
-# Or set directly (not recommended for prod)
-# openai.api_key = "sk-..."
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 @app.post("/evaluate")
 async def evaluate(request: Request):
     try:
-        # Read raw body and decode
+        # Read raw body (for debugging)
         body_bytes = await request.body()
         body_str = body_bytes.decode("utf-8")
-
         print("Raw request body:\n", body_str)
 
-        # Load as JSON
-        json_data = json.loads(body_str)
-
-        # Optional: Log parsed data
+        # Parse JSON directly from request
+        json_data = await request.json()
         print("Parsed JSON:\n", json.dumps(json_data, indent=2))
 
-        # Compose prompt
+        # Prompt creation
         system_prompt = "You are an expert trading assistant. You analyze signals and return a probability of success between 0 and 1."
         user_prompt = f"""Evaluate this trade signal:
 
@@ -34,9 +28,9 @@ async def evaluate(request: Request):
 
 Respond with only the numeric probability, between 0 and 1."""
 
-        # GPT call
+        # GPT-4 call
         response = openai.ChatCompletion.create(
-            model="gpt-5",  # or "gpt-4o", or "gpt-5" if available
+            model="gpt-4",  # or "gpt-4o"
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -48,10 +42,11 @@ Respond with only the numeric probability, between 0 and 1."""
         reply = response['choices'][0]['message']['content'].strip()
         print("GPT reply:", reply)
 
-        # Parse reply as float
+        # Return float if possible
         probability = float(reply)
-        return probability
+        return {"probability": probability}
 
     except Exception as e:
-        print("❌ Error:", str(e))
-        return {"error": str(e)}
+        # Full error logging
+        print("❌ Exception caught in /evaluate:", str(e))
+        return JSONResponse(status_code=500, content={"error": str(e)})
