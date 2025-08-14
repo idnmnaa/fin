@@ -9,19 +9,23 @@ app = FastAPI()
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+# Укажи явную версию кода (меняй при каждом обновлении)
+CODE_VERSION = "v1.2.0"
+
+print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
+
 @app.post("/evaluate")
 async def evaluate(request: Request):
     try:
-        # 1. Читаем тело запроса
+        print(f"\n📥 New request received — version: {CODE_VERSION}")
+
         body_bytes = await request.body()
         body_str = body_bytes.decode("utf-8")
         print("Raw request body:\n", body_str)
 
-        # 2. Преобразуем в JSON
-        json_data = await request.json()
+        json_data = json.loads(body_str)
         print("Parsed JSON:\n", json.dumps(json_data, indent=2))
 
-        # 3. Формируем промпт
         system_prompt = "You are an expert trading assistant. You analyze signals and return a probability of success between 0 and 1."
         user_prompt = f"""Evaluate this trade signal and return a number from 0 to 1:
 
@@ -29,9 +33,8 @@ async def evaluate(request: Request):
 
 Only respond with the numeric probability."""
 
-        # 4. Вызываем GPT
         response = openai.ChatCompletion.create(
-            model="gpt-4o",  # or "gpt-4o" or "gpt-3.5-turbo"
+            model="gpt-4",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -43,12 +46,10 @@ Only respond with the numeric probability."""
         reply = response['choices'][0]['message']['content'].strip()
         print("GPT reply:", reply)
 
-        # 5. Преобразуем в число и возвращаем
         probability = float(reply)
         return {"probability": probability}
 
     except Exception as e:
         print("❌ ERROR:", str(e))
-        print("📄 Traceback:")
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
