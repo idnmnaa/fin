@@ -6,7 +6,7 @@ import os, json, traceback
 app = FastAPI()
 
 # === Version banner ===
-CODE_VERSION = "v1.3.0-json-sanitize"
+CODE_VERSION = "v1.4.0"
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 # === OpenAI client ===
@@ -16,7 +16,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Allow overriding model via env, default to a strong general model.
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-nano")
 
 def parse_json_strict_but_safe(body_bytes: bytes) -> dict:
     """
