@@ -16,7 +16,7 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Allow overriding model via env, default to a strong general model.
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-nano")
 
 def parse_json_strict_but_safe(body_bytes: bytes) -> dict:
     """
