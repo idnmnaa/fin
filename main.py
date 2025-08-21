@@ -6,7 +6,7 @@ import os, json, traceback, re
 app = FastAPI()
 
 # === Version banner ===
-CODE_VERSION = "v1.6.0"
+CODE_VERSION = "v1.6.1"
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 # === OpenAI client ===
@@ -21,8 +21,8 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-nano").strip()
 
 def is_nano_or_mini(model_name: str) -> bool:
     """
-    Heuristic: nano/mini/small tiers use max_completion_tokens and often disallow temperature control.
-    Adjust this if your org uses different naming.
+    Heuristic: nano/mini/small tiers often have constrained params
+    (no temperature/stop, use max_completion_tokens).
     """
     m = model_name.lower()
     return any(k in m for k in ["nano", "mini", "small"])
@@ -76,7 +76,6 @@ async def evaluate(request: Request):
         print("Parsed JSON OK. Keys:", list(payload.keys()))
 
         # --- Token-lean prompts ---
-        # Keep system prompt ultra-short; user content is just compact JSON
         system_prompt = "Return ONLY one number in [0,1] (no text)."
         compact_json = json.dumps(payload, separators=(",", ":"))
 
@@ -87,35 +86,36 @@ async def evaluate(request: Request):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": compact_json},
             ],
-            "stop": ["\n"],
             "n": 1,
         }
 
         if is_nano_or_mini(MODEL_NAME):
-            # nano/mini: no temperature; use max_completion_tokens
+            # nano/mini: no temperature, no stop; use max_completion_tokens
             args["max_completion_tokens"] = int(os.getenv("MAX_COMPLETION_TOKENS", "3"))
         else:
-            # larger chat models
+            # larger chat models: allow temperature + stop + max_tokens
             args["max_tokens"] = int(os.getenv("MAX_TOKENS", "3"))
             args["temperature"] = float(os.getenv("TEMPERATURE", "0"))
+            args["stop"] = ["\n"]
 
-        # Call OpenAI
+        # Call OpenAI with one auto-heal retry on 400
         try:
             resp = client.chat.completions.create(**args)
         except BadRequestError as e:
-            # Graceful fallback if org/model changes parameter support
             msg = str(e)
             print("⚠️ BadRequestError, attempting auto-fix:", msg)
 
-            # Strip temperature if it's rejected
-            if "temperature" in msg and "Unsupported" in msg:
-                args.pop("temperature", None)
+            # Generic stripper for "Unsupported parameter: 'xyz'"
+            m = re.findall(r"Unsupported parameter: '([^']+)'", msg)
+            for param in m:
+                if param in args:
+                    args.pop(param, None)
 
-            # Swap token cap if needed
-            if "max_tokens" in msg and "Unsupported parameter" in msg:
+            # Also handle token-cap swap hints
+            if "max_tokens" in msg and "Unsupported" in msg:
                 args.pop("max_tokens", None)
                 args["max_completion_tokens"] = int(os.getenv("MAX_COMPLETION_TOKENS", "3"))
-            if "max_completion_tokens" in msg and "Unsupported parameter" in msg:
+            if "max_completion_tokens" in msg and "Unsupported" in msg:
                 args.pop("max_completion_tokens", None)
                 args["max_tokens"] = int(os.getenv("MAX_TOKENS", "3"))
 
@@ -140,7 +140,6 @@ async def evaluate(request: Request):
         return {"probability": prob, "version": CODE_VERSION, "model": MODEL_NAME}
 
     except BadRequestError as e:
-        # Surface OpenAI 4xx nicely
         print("❌ OpenAI BadRequestError:", str(e))
         return JSONResponse(status_code=400, content={"error": str(e), "version": CODE_VERSION})
     except Exception as e:
