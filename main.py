@@ -60,7 +60,7 @@ async def evaluate(request: Request):
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0,
-            max_tokens=3,          # the correct param for chat.completions
+            max_completion_tokens=3,          # the correct param for chat.completions
             stop=["\n"],           # help cut off extra tokens
             n=1,
             seed=0                 # optional: reproducibility
