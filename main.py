@@ -2,57 +2,114 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from openai import OpenAI, BadRequestError
 import os, json, traceback, re
+from typing import Optional
 
 app = FastAPI()
 
-# === Version banner ===
-CODE_VERSION = "v1.6.1"
+CODE_VERSION = "v1.6.2"
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
-# === OpenAI client ===
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY is not set. The /evaluate route will fail until it is provided.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Allow overriding model via env; default to a cheap model.
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-nano").strip()
-
+STRICT_FAIL_ON_UNPARSABLE = os.getenv("STRICT_FAIL_ON_UNPARSABLE", "0").strip() == "1"
 
 def is_nano_or_mini(model_name: str) -> bool:
-    """
-    Heuristic: nano/mini/small tiers often have constrained params
-    (no temperature/stop, use max_completion_tokens).
-    """
     m = model_name.lower()
     return any(k in m for k in ["nano", "mini", "small"])
 
-
 def parse_json_strict_but_safe(body_bytes: bytes) -> dict:
-    """
-    MQL5 WebRequest bodies can include trailing nulls or junk.
-    Steps:
-      1) drop nulls
-      2) find first '{' and last '}'
-      3) decode and json.loads
-    """
     tail = body_bytes[-16:] if len(body_bytes) >= 16 else body_bytes
     print(f"📦 Incoming bytes: len={len(body_bytes)} tail={repr(tail)}")
-
     cleaned = body_bytes.replace(b"\x00", b"")
     start = cleaned.find(b"{")
     end = cleaned.rfind(b"}")
     if start == -1 or end == -1 or end < start:
         raise ValueError("No valid JSON object delimiters found in body")
-
     s = cleaned[start:end + 1].decode("utf-8", errors="ignore").strip()
     return json.loads(s)
 
+def extract_probability(text: str) -> Optional[float]:
+    """
+    Accepts:
+    - "0.73", "0.7\n", "Probability: 0.73", " 1 " etc.
+    Returns float in [0,1] or None.
+    """
+    if not text:
+        return None
+    text = text.strip()
+    # Fast path: bare number
+    try:
+        val = float(text)
+        if 0.0 <= val <= 1.0:
+            return val
+    except Exception:
+        pass
+    # Fallback regex: first 0.x or 1 or 1.0
+    m = re.search(r"(?<!\d)(?:0(?:\.\d+)?|1(?:\.0+)?)", text)
+    if m:
+        try:
+            val = float(m.group(0))
+            if 0.0 <= val <= 1.0:
+                return val
+        except Exception:
+            return None
+    return None
+
+def build_args(system_prompt: str, compact_json: str, *, max_tok_primary=3, max_tok_retry=6, retry=False):
+    """
+    Build model-specific args, with a slightly higher token cap on retry.
+    """
+    args = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": compact_json},
+        ],
+        "n": 1,
+    }
+    if is_nano_or_mini(MODEL_NAME):
+        args["max_completion_tokens"] = max_tok_retry if retry else max_tok_primary
+        # nano/mini: no temperature, no stop
+    else:
+        args["max_tokens"] = max_tok_retry if retry else max_tok_primary
+        args["temperature"] = 0
+        args["stop"] = ["\n"]
+    return args
+
+def auto_heal_and_call(args):
+    """
+    Calls chat.completions.create(**args), and if a 400 occurs due to unsupported params,
+    strips them and retries once.
+    """
+    try:
+        return client.chat.completions.create(**args)
+    except BadRequestError as e:
+        msg = str(e)
+        print("⚠️ BadRequestError, attempting auto-fix:", msg)
+        # Strip explicitly named unsupported params
+        for p in re.findall(r"Unsupported parameter: '([^']+)'", msg):
+            args.pop(p, None)
+        # Token-cap swap
+        if "max_tokens" in msg and "Unsupported" in msg:
+            args.pop("max_tokens", None)
+            args["max_completion_tokens"] = args.get("max_completion_tokens", 3)
+        if "max_completion_tokens" in msg and "Unsupported" in msg:
+            args.pop("max_completion_tokens", None)
+            args["max_tokens"] = args.get("max_tokens", 3)
+        # Temperature / stop sometimes rejected on smaller models
+        if "temperature" in msg and "Unsupported" in msg:
+            args.pop("temperature", None)
+        if "stop" in msg and "Unsupported" in msg:
+            args.pop("stop", None)
+        return client.chat.completions.create(**args)
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": CODE_VERSION, "model": MODEL_NAME}
-
 
 @app.post("/evaluate")
 async def evaluate(request: Request):
@@ -62,7 +119,6 @@ async def evaluate(request: Request):
         preview = body_bytes[:400]
         print("Raw request (first 400 bytes):", preview.decode("utf-8", errors="ignore"))
 
-        # Robust parsing
         try:
             payload = parse_json_strict_but_safe(body_bytes)
         except Exception as pe:
@@ -74,65 +130,35 @@ async def evaluate(request: Request):
             )
 
         print("Parsed JSON OK. Keys:", list(payload.keys()))
-
-        # --- Token-lean prompts ---
-        system_prompt = "Return ONLY one number in [0,1] (no text)."
         compact_json = json.dumps(payload, separators=(",", ":"))
 
-        # Build model-specific args
-        args = {
-            "model": MODEL_NAME,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": compact_json},
-            ],
-            "n": 1,
-        }
-
-        if is_nano_or_mini(MODEL_NAME):
-            # nano/mini: no temperature, no stop; use max_completion_tokens
-            args["max_completion_tokens"] = int(os.getenv("MAX_COMPLETION_TOKENS", "3"))
-        else:
-            # larger chat models: allow temperature + stop + max_tokens
-            args["max_tokens"] = int(os.getenv("MAX_TOKENS", "3"))
-            args["temperature"] = float(os.getenv("TEMPERATURE", "0"))
-            args["stop"] = ["\n"]
-
-        # Call OpenAI with one auto-heal retry on 400
-        try:
-            resp = client.chat.completions.create(**args)
-        except BadRequestError as e:
-            msg = str(e)
-            print("⚠️ BadRequestError, attempting auto-fix:", msg)
-
-            # Generic stripper for "Unsupported parameter: 'xyz'"
-            m = re.findall(r"Unsupported parameter: '([^']+)'", msg)
-            for param in m:
-                if param in args:
-                    args.pop(param, None)
-
-            # Also handle token-cap swap hints
-            if "max_tokens" in msg and "Unsupported" in msg:
-                args.pop("max_tokens", None)
-                args["max_completion_tokens"] = int(os.getenv("MAX_COMPLETION_TOKENS", "3"))
-            if "max_completion_tokens" in msg and "Unsupported" in msg:
-                args.pop("max_completion_tokens", None)
-                args["max_tokens"] = int(os.getenv("MAX_TOKENS", "3"))
-
-            # Retry once
-            resp = client.chat.completions.create(**args)
-
+        # Ultra-lean, explicit instruction
+        system_prompt_primary = "Output a single number in [0,1]. No text."
+        args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
+        resp = auto_heal_and_call(args)
         reply = (resp.choices[0].message.content or "").strip()
-        print("🧠 GPT raw reply:", repr(reply))
+        print("🧠 GPT raw reply (try1):", repr(reply))
 
-        # Parse a single float in [0,1]
-        try:
-            prob = float(reply)
-        except ValueError:
-            m = re.search(r"\b(0(?:\.\d+)?|1(?:\.0+)?)\b", reply)
-            if not m:
-                raise ValueError(f"Model did not return a numeric probability: {reply}")
-            prob = float(m.group(1))
+        prob = extract_probability(reply)
+        if prob is None:
+            # Retry once with even stricter instruction and a touch more tokens
+            system_prompt_retry = "ONLY digits for a number in [0,1]. Example: 0.73"
+            args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
+            resp2 = auto_heal_and_call(args_retry)
+            reply2 = (resp2.choices[0].message.content or "").strip()
+            print("🧠 GPT raw reply (try2):", repr(reply2))
+            prob = extract_probability(reply2)
+
+        if prob is None:
+            msg = "Model did not return a numeric probability"
+            print(f"⚠️ {msg}. Using fallback.")
+            if STRICT_FAIL_ON_UNPARSABLE:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": msg, "version": CODE_VERSION, "model": MODEL_NAME},
+                )
+            # Fallback: 0.5 (deterministic neutral)
+            prob = 0.5
 
         # Clamp
         prob = min(1.0, max(0.0, prob))
@@ -147,8 +173,6 @@ async def evaluate(request: Request):
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e), "version": CODE_VERSION})
 
-
-# Optional: simple root to avoid 404 noise on /
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
