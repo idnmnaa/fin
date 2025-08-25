@@ -14,7 +14,7 @@ if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY is not set. The /evaluate route will fail until it is provided.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-5-nano").strip()
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini").strip()
 STRICT_FAIL_ON_UNPARSABLE = os.getenv("STRICT_FAIL_ON_UNPARSABLE", "0").strip() == "1"
 
 def is_nano_or_mini(model_name: str) -> bool:
@@ -128,8 +128,8 @@ async def evaluate(request: Request):
                 status_code=400,
                 content={"error": "Invalid JSON", "details": str(pe), "version": CODE_VERSION},
             )
-
-        print("Parsed JSON OK. Keys:", list(payload.keys()))
+    
+        #print("Parsed JSON OK. Keys:", list(payload.keys()))
         compact_json = json.dumps(payload, separators=(",", ":"))
 
         # Ultra-lean, explicit instruction
@@ -137,7 +137,7 @@ async def evaluate(request: Request):
         args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
         resp = auto_heal_and_call(args)
         reply = (resp.choices[0].message.content or "").strip()
-        print("🧠 GPT raw reply (try1):", repr(reply))
+        #print("🧠 GPT raw reply (try1):", repr(reply))
 
         prob = extract_probability(reply)
         if prob is None:
@@ -146,7 +146,7 @@ async def evaluate(request: Request):
             args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
             resp2 = auto_heal_and_call(args_retry)
             reply2 = (resp2.choices[0].message.content or "").strip()
-            print("🧠 GPT raw reply (try2):", repr(reply2))
+            #print("🧠 GPT raw reply (try2):", repr(reply2))
             prob = extract_probability(reply2)
 
         if prob is None:
