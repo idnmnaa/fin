@@ -134,9 +134,7 @@ async def evaluate(request: Request):
 
         # Ultra-lean, explicit instruction
         system_prompt_primary = (
-            "Check SMA50, RSI, ADX, body_wick_ratio, news flag, and HTF context. "
-            "Return a single probability in [0,1] based on these factors. "
-            "No text, only the probability."
+            "Check crosses + SMA trend + RSI + ADX on crossed timeframe.Check SMA alignment + RSI + ADX on higher timeframe as confirmation.If both align → clean probability. If HTF contradicts → reduce probability. Return a single probability in [0,1] based on these factors. No text, only the probability."
         )
         args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
         resp = auto_heal_and_call(args)
@@ -147,8 +145,7 @@ async def evaluate(request: Request):
         if prob is None:
             # Retry once with even stricter instruction and a touch more tokens
             system_prompt_retry = (
-                "ONLY return a probability in [0,1] based on SMA50, RSI, ADX, body_wick_ratio, "
-                "news flag, and HTF context. Example: 0.73"
+                "ONLY return a probability in [0,1].Check crosses + SMA trend + RSI + ADX on crossed timeframe.Check SMA alignment + RSI + ADX on higher timeframe as confirmation.If both align → clean probability. If HTF contradicts → reduce probability. No text, only the probability."
             )
             args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
             resp2 = auto_heal_and_call(args_retry)
