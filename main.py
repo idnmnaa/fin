@@ -6,7 +6,7 @@ from typing import Optional
 
 app = FastAPI()
 
-CODE_VERSION = "v1.6.2"
+CODE_VERSION = "v1.6.3"
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -133,7 +133,11 @@ async def evaluate(request: Request):
         compact_json = json.dumps(payload, separators=(",", ":"))
 
         # Ultra-lean, explicit instruction
-        system_prompt_primary = "Output a single number in [0,1]. No text."
+        system_prompt_primary = (
+            "Check SMA50, RSI, ADX, body_wick_ratio, news flag, and HTF context. "
+            "Return a single probability in [0,1] based on these factors. "
+            "No text, only the probability."
+        )
         args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
         resp = auto_heal_and_call(args)
         reply = (resp.choices[0].message.content or "").strip()
@@ -142,7 +146,10 @@ async def evaluate(request: Request):
         prob = extract_probability(reply)
         if prob is None:
             # Retry once with even stricter instruction and a touch more tokens
-            system_prompt_retry = "ONLY digits for a number in [0,1]. Example: 0.73"
+            system_prompt_retry = (
+                "ONLY return a probability in [0,1] based on SMA50, RSI, ADX, body_wick_ratio, "
+                "news flag, and HTF context. Example: 0.73"
+            )
             args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
             resp2 = auto_heal_and_call(args_retry)
             reply2 = (resp2.choices[0].message.content or "").strip()
