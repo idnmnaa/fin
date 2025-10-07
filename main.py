@@ -14,7 +14,7 @@ if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY is not set. The /evaluate route will fail until it is provided.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-MODEL_NAME = "gpt-5-mini"
+MODEL_NAME = "gpt-4o-mini"
 STRICT_FAIL_ON_UNPARSABLE = os.getenv("STRICT_FAIL_ON_UNPARSABLE", "0").strip() == "1"
 def extract_binary(text: str) -> Optional[int]:
     """Return 0 or 1 if present; else None."""
@@ -169,3 +169,4 @@ async def evaluate(request: Request):
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
+
