@@ -135,7 +135,7 @@ async def evaluate(request: Request):
             "Decision rules:\n"
             "1) If any structural filter indicates sideways/ranging, output 0.\n"
             "2) Otherwise weigh higher timeframe 70% and signal timeframe 30%.\n"
-            "3) If both timeframes align (bullish or bearish) and no sideways condition, output 1; else 0.\n"
+            "3) If both align and no sideways condition is present, return 1.\n"
             "Output exactly one character: 0 or 1. No words, no spaces, no punctuation."
         )
         args = build_args(system_prompt_primary, compact_json, max_tok_primary=1, max_tok_retry=1, retry=False)
@@ -169,4 +169,5 @@ async def evaluate(request: Request):
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
+
 
