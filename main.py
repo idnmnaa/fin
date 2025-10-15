@@ -6,7 +6,7 @@ from typing import Optional
 
 app = FastAPI()
 
-CODE_VERSION = "v1.7.1"
+CODE_VERSION = "v1.8."
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -14,19 +14,8 @@ if not OPENAI_API_KEY:
     print("⚠️ OPENAI_API_KEY is not set. The /evaluate route will fail until it is provided.")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-MODEL_NAME = "gpt-4o-mini"
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini").strip()
 STRICT_FAIL_ON_UNPARSABLE = os.getenv("STRICT_FAIL_ON_UNPARSABLE", "0").strip() == "1"
-def extract_binary(text: str) -> Optional[int]:
-    """Return 0 or 1 if present; else None."""
-    if not text:
-        return None
-    t = text.strip()
-    if t == "0":
-        return 0
-    if t == "1":
-        return 1
-    m = re.search(r"[01]", t)
-    return int(m.group(0)) if m else None
 
 def is_nano_or_mini(model_name: str) -> bool:
     m = model_name.lower()
@@ -44,7 +33,11 @@ def parse_json_strict_but_safe(body_bytes: bytes) -> dict:
     return json.loads(s)
 
 def extract_probability(text: str) -> Optional[float]:
-    
+    """
+    Accepts:
+    - "0.73", "0.7\n", "Probability: 0.73", " 1 " etc.
+    Returns float in [0,1] or None.
+    """
     if not text:
         return None
     text = text.strip()
@@ -66,9 +59,9 @@ def extract_probability(text: str) -> Optional[float]:
             return None
     return None
 
-def build_args(system_prompt: str, compact_json: str, *, max_tok_primary=1, max_tok_retry=1, retry=False):
+def build_args(system_prompt: str, compact_json: str, *, max_tok_primary=3, max_tok_retry=6, retry=False):
     """
-    Build model-specific args for a single-character output.
+    Build model-specific args, with a slightly higher token cap on retry.
     """
     args = {
         "model": MODEL_NAME,
@@ -77,12 +70,15 @@ def build_args(system_prompt: str, compact_json: str, *, max_tok_primary=1, max_
             {"role": "user", "content": compact_json},
         ],
         "n": 1,
-        "max_tokens": max_tok_retry if retry else max_tok_primary,
-        "temperature": 0,
-        "stop": ["\n"],
     }
+    if is_nano_or_mini(MODEL_NAME):
+        args["max_completion_tokens"] = max_tok_retry if retry else max_tok_primary
+        # nano/mini: no temperature, no stop
+    else:
+        args["max_tokens"] = max_tok_retry if retry else max_tok_primary
+        args["temperature"] = 0
+        args["stop"] = ["\n"]
     return args
-
 
 def auto_heal_and_call(args):
     """
@@ -94,23 +90,28 @@ def auto_heal_and_call(args):
     except BadRequestError as e:
         msg = str(e)
         print("⚠️ BadRequestError, attempting auto-fix:", msg)
-        # Remove commonly unrecognized params for chat.completions
-        for p in ["max_completion_tokens", "stop", "temperature"]:
-            if p in args:
-                args.pop(p, None)
-        # Ensure we have max_tokens
-        if "max_tokens" not in args:
-            args["max_tokens"] = 3
+        # Strip explicitly named unsupported params
+        for p in re.findall(r"Unsupported parameter: '([^']+)'", msg):
+            args.pop(p, None)
+        # Token-cap swap
+        if "max_tokens" in msg and "Unsupported" in msg:
+            args.pop("max_tokens", None)
+            args["max_completion_tokens"] = args.get("max_completion_tokens", 3)
+        if "max_completion_tokens" in msg and "Unsupported" in msg:
+            args.pop("max_completion_tokens", None)
+            args["max_tokens"] = args.get("max_tokens", 3)
+        # Temperature / stop sometimes rejected on smaller models
+        if "temperature" in msg and "Unsupported" in msg:
+            args.pop("temperature", None)
+        if "stop" in msg and "Unsupported" in msg:
+            args.pop("stop", None)
         return client.chat.completions.create(**args)
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": CODE_VERSION, "model": MODEL_NAME}
 
-
-
-
-@app.post("/evaluate", response_class=PlainTextResponse)
+@app.post("/evaluate")
 async def evaluate(request: Request):
     print(f"\n📥 New request — version: {CODE_VERSION}")
     try:
@@ -123,51 +124,83 @@ async def evaluate(request: Request):
         except Exception as pe:
             print("❌ JSON parse error:", str(pe))
             traceback.print_exc()
-            return PlainTextResponse("0", status_code=400)
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid JSON", "details": str(pe), "version": CODE_VERSION},
+            )
     
+        #print("Parsed JSON OK. Keys:", list(payload.keys()))
         compact_json = json.dumps(payload, separators=(",", ":"))
 
+        # Ultra-lean, explicit instruction
         system_prompt_primary = (
-            "You are a strict trading rules engine. Analyze the provided JSON of indicators.\n"
-            "- Signal timeframe: check SMA cross, SMA trend, RSI, and ADX.\n"
-            "- Higher timeframe confirmation: check SMA alignment, RSI, and ADX.\n"
-            "- Structural filters: InsideBarCluster, ATRCompression, SwingProximityATR, HTF_RSIZone.\n"
-            "Decision rules:\n"
-            "1) If any structural filter indicates sideways/ranging, output 0.\n"
-            "2) Otherwise weigh higher timeframe 70% and signal timeframe 30%.\n"
-            "3) If both align and no sideways condition is present, return 1.\n"
-            "Output exactly one character: 0 or 1. No words, no spaces, no punctuation."
+            """
+You are an experienced market analyst.
+Analyze the provided JSON of technical and structural indicators.
+
+Your goal is to evaluate if current conditions favor entering a trade (TAKE>0) or avoiding it (SKIP-0).
+Consider:
+- Signal timeframe: SMA cross and trend, RSI level and slope, ADX strength.
+- Higher timeframe: alignment of SMA, RSI, and ADX.
+- Structural filters: InsideBarCluster, ATRCompression, SwingProximityATR, SidewayStructure, HTF_RSIZone.
+Interpret the data holistically. 
+If conditions indicate clear directional momentum and higher timeframe alignment, lean toward TAKE.
+If conditions show compression, choppy movement, or contradictory higher timeframe structure, lean toward SKIP.Return a single probability in [0,1] based on these factors. No text, only the probability.
+"""
         )
-        args = build_args(system_prompt_primary, compact_json, max_tok_primary=1, max_tok_retry=1, retry=False)
+        args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
         resp = auto_heal_and_call(args)
         reply = (resp.choices[0].message.content or "").strip()
+        #print("🧠 GPT raw reply (try1):", repr(reply))
 
-        val = extract_binary(reply)
-        if val is None:
-            args_retry = build_args(system_prompt_primary, compact_json, max_tok_primary=1, max_tok_retry=1, retry=True)
+        prob = extract_probability(reply)
+        if prob is None:
+            # Retry once with even stricter instruction and a touch more tokens
+            system_prompt_retry = (
+               """
+You are an experienced market analyst.
+Analyze the provided JSON of technical and structural indicators.
+
+Your goal is to evaluate if current conditions favor entering a trade (TAKE>0) or avoiding it (SKIP-0).
+Consider:
+- Signal timeframe: SMA cross and trend, RSI level and slope, ADX strength.
+- Higher timeframe: alignment of SMA, RSI, and ADX.
+- Structural filters: InsideBarCluster, ATRCompression, SwingProximityATR, SidewayStructure, HTF_RSIZone.
+Interpret the data holistically. 
+If conditions indicate clear directional momentum and higher timeframe alignment, lean toward TAKE.
+If conditions show compression, choppy movement, or contradictory higher timeframe structure, lean toward SKIP.Return a single probability in [0,1] based on these factors. No text, only the probability.
+"""
+            )
+            args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
             resp2 = auto_heal_and_call(args_retry)
             reply2 = (resp2.choices[0].message.content or "").strip()
-            val = extract_binary(reply2)
+            #print("🧠 GPT raw reply (try2):", repr(reply2))
+            prob = extract_probability(reply2)
 
-        if val is None:
-            print("⚠️ Model did not return 0/1. Using fallback 0.")
+        if prob is None:
+            msg = "Model did not return a numeric probability"
+            print(f"⚠️ {msg}. Using fallback.")
             if STRICT_FAIL_ON_UNPARSABLE:
-                return PlainTextResponse("0", status_code=502)
-            val = 0
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": msg, "version": CODE_VERSION, "model": MODEL_NAME},
+                )
+            # Fallback: 0.5 (deterministic neutral)
+            prob = 0.5
 
-        decision = int(val)
-        print(f"✅ Final decision: {decision}")
-        return PlainTextResponse(str(decision))
+        # Clamp
+        prob = min(1.0, max(0.0, prob))
+        print(f"✅ Final probability: {prob:.4f}")
+        return {"probability": prob, "version": CODE_VERSION, "model": MODEL_NAME}
 
     except BadRequestError as e:
         print("❌ OpenAI BadRequestError:", str(e))
-        return PlainTextResponse("0", status_code=400)
+        return JSONResponse(status_code=400, content={"error": str(e), "version": CODE_VERSION})
     except Exception as e:
         print("❌ Unhandled ERROR:", str(e))
         traceback.print_exc()
-        return PlainTextResponse("0", status_code=500)
+        return JSONResponse(status_code=500, content={"error": str(e), "version": CODE_VERSION})
+
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
-
-
