@@ -1,13 +1,13 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from openai import OpenAI, BadRequestError
-import os, json, traceback, re, threading
+import os, json, traceback, re, threading, asyncio
 from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
-CODE_VERSION = "v1.10."
+CODE_VERSION = "v1.11."
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -27,8 +27,7 @@ _MAX_AGE = timedelta(hours=1)
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-# ===================== HELPERS =====================
-
+# ----------------- Generic helpers -----------------
 def is_nano_or_mini(model_name: str) -> bool:
     m = model_name.lower()
     return any(k in m for k in ["nano", "mini", "small"])
@@ -45,10 +44,6 @@ def parse_json_strict_but_safe(body_bytes: bytes) -> dict:
     return json.loads(s)
 
 def extract_probability(text: str) -> Optional[float]:
-    """
-    Accepts bare numbers or strings like 'Probability: 0.73'
-    Returns float in [0,1] or None.
-    """
     if not text:
         return None
     text = text.strip()
@@ -71,11 +66,6 @@ def extract_probability(text: str) -> Optional[float]:
 _TF_RE = re.compile(r"^\s*([mMhH])\s*([0-9]+)\s*$")
 
 def timeframe_to_seconds(tf: Optional[str]) -> int:
-    """
-    Supports 'M1', 'M3', 'M5', 'M15', 'M30', 'H1', 'H2', 'H4', etc.
-    Also tolerates 'PERIOD_M5' forms.
-    Fallback = 60 seconds.
-    """
     if not tf or not isinstance(tf, str):
         return 60
     m = _TF_RE.match(tf)
@@ -89,10 +79,6 @@ def timeframe_to_seconds(tf: Optional[str]) -> int:
     return (num * 60) if unit == "M" else (num * 3600)
 
 def parse_first_bar_time(payload: Dict[str, Any]) -> Optional[datetime]:
-    """
-    Expects payload["bars"][0]["t"] in ISO 8601, e.g. '2025-10-17T20:00:00Z'
-    Returns timezone-aware UTC datetime or None.
-    """
     try:
         bars = payload.get("bars") or []
         if not bars:
@@ -116,24 +102,13 @@ def floor_to_bar(dt: datetime, bar_sec: int) -> datetime:
     return datetime.fromtimestamp(floored, tz=timezone.utc)
 
 def canonical_key(sym: str, tf: str, first_bar_dt: datetime, bar_sec: int) -> str:
-    """
-    Key: Sym + TF + first-bar time floored to the bar grid.
-    Example: "STOXX50|M3|2025-10-17T20:00:00+00:00"
-    """
     base_dt = floor_to_bar(first_bar_dt, bar_sec)
     return f"{sym}|{tf}|{base_dt.isoformat()}"
 
 def compute_tolerance_seconds(bar_sec: int) -> int:
-    """
-    Tolerance for proximity time matching: half a bar, clamped to [30, 180] seconds.
-    """
     return max(30, min(180, bar_sec // 2 if bar_sec > 0 else 60))
 
 def _extract_sym_tf(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Pull symbol/timeframe from either root or meta.
-    Normalizes to uppercase strings.
-    """
     meta = payload.get("meta") or {}
     sym = payload.get("sym") or payload.get("symbol") or meta.get("sym") or meta.get("symbol")
     tf  = payload.get("tf")  or payload.get("timeframe") or payload.get("TF") \
@@ -142,13 +117,8 @@ def _extract_sym_tf(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[st
     if isinstance(tf, str):  tf  = tf.strip().upper()
     return sym, tf
 
+# ----------------- Cache lookup/store/clean -----------------
 def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
-    """
-    Matching policy:
-      - Same sym & tf
-      - First bar time within ±tolerance seconds of a cached entry
-      - Or exact canonical key match
-    """
     sym, tf = _extract_sym_tf(payload)
     if not sym or not tf:
         return None
@@ -164,8 +134,9 @@ def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
         # 1) Exact key match
         for row in reversed(GPTarr):
             if row.get("key") == key_exact and isinstance(row.get("answer"), (int, float)):
-                print(f"💾 Cache HIT (exact): {key_exact}")
-                return float(row["answer"])
+                prob = float(row["answer"])
+                print(f"💾 Cache HIT (exact) — key={key_exact} prob={prob:.4f}")
+                return prob
 
         # 2) Proximity by sym/tf and |dt diff| ≤ tol
         fb_epoch = int(first_bar_dt.timestamp())
@@ -176,21 +147,19 @@ def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
             if not isinstance(row_dt, datetime):
                 continue
             if abs(int(row_dt.timestamp()) - fb_epoch) <= tol:
-                print(f"💾 Cache HIT (prox): {sym}|{tf} ~ {first_bar_dt.isoformat()}±{tol}s")
                 ans = row.get("answer")
-                return float(ans) if isinstance(ans, (int, float)) else None
-
+                if isinstance(ans, (int, float)):
+                    prob = float(ans)
+                    print(f"💾 Cache HIT (prox ±{tol}s) — sym={sym} tf={tf} "
+                          f"req={first_bar_dt.isoformat()} cached={row_dt.isoformat()} prob={prob:.4f}")
+                    return prob
     return None
 
-def add_cache_record(payload: Dict[str, Any], answer: float) -> None:
-    """
-    Store only the minimal facts: sym, tf, first bar time, answer, key.
-    No request body is persisted.
-    """
+def add_cache_record(payload: Dict[str, Any], answer: float) -> str:
     sym, tf = _extract_sym_tf(payload)
     first_bar_dt = parse_first_bar_time(payload)
     if not sym or not tf or not first_bar_dt:
-        return
+        return "N/A"
     bar_sec = timeframe_to_seconds(tf)
     key = canonical_key(sym, tf, first_bar_dt, bar_sec)
     row = {
@@ -204,21 +173,51 @@ def add_cache_record(payload: Dict[str, Any], answer: float) -> None:
     }
     with _GPTARR_LOCK:
         GPTarr.append(row)
+    print(f"🆕 Unique result stored — key={key} prob={answer:.4f}")
+    return key
 
 def clean_cache() -> None:
-    """
-    Purge entries where NOW - FIRST_BAR_TIME > 1 hour (as requested).
-    """
     cutoff = _now_utc() - _MAX_AGE
     with _GPTARR_LOCK:
         before = len(GPTarr)
         GPTarr[:] = [r for r in GPTarr if isinstance(r.get("time_dt"), datetime) and r["time_dt"] >= cutoff]
         after = len(GPTarr)
     if before != after:
-        print(f"🧹 Cache cleaned: {before} -> {after} (older than {_MAX_AGE})")
+        print(f"🧹 Cache cleaned: {before} -> {after} (drop if first_bar_dt < {cutoff.isoformat()})")
+
+# ===================== IN-FLIGHT DEDUPE =====================
+# Followers wait briefly for the leader’s result to avoid duplicate GPT calls.
+_INFLIGHT: Dict[str, asyncio.Future] = {}
+_INFLIGHT_LOCK = asyncio.Lock()
+
+def inflight_bucket_key(sym: str, tf: str, first_bar_dt: datetime, bar_sec: int) -> str:
+    """
+    Proximity bucket (coarser than cache key) so tiny time differences coalesce:
+    bucket by round(epoch / tol), where tol = half a bar (clamped 30..180).
+    """
+    tol = compute_tolerance_seconds(bar_sec)
+    buck = int(round(first_bar_dt.timestamp() / tol))
+    return f"{sym}|{tf}|prox|{tol}|{buck}"
+
+async def inflight_acquire(key: str) -> Tuple[bool, asyncio.Future]:
+    async with _INFLIGHT_LOCK:
+        fut = _INFLIGHT.get(key)
+        if fut and not fut.done():
+            return False, fut  # follower
+        fut = asyncio.get_event_loop().create_future()
+        _INFLIGHT[key] = fut
+        return True, fut       # leader
+
+async def inflight_finish(key: str, result: float = None, err: Exception = None):
+    async with _INFLIGHT_LOCK:
+        fut = _INFLIGHT.pop(key, None)
+    if fut and not fut.done():
+        if err is not None:
+            fut.set_exception(err)
+        else:
+            fut.set_result(result)
 
 # ===================== MODEL CALLERS =====================
-
 def build_args(system_prompt: str, compact_json: str, *, max_tok_primary=3, max_tok_retry=6, retry=False):
     args = {
         "model": MODEL_NAME,
@@ -257,7 +256,6 @@ def auto_heal_and_call(args):
         return client.chat.completions.create(**args)
 
 # ===================== ROUTES =====================
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "version": CODE_VERSION, "model": MODEL_NAME, "cache_size": len(GPTarr)}
@@ -275,22 +273,47 @@ async def evaluate(request: Request):
         except Exception as pe:
             print("❌ JSON parse error:", str(pe))
             traceback.print_exc()
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Invalid JSON", "details": str(pe), "version": CODE_VERSION},
-            )
+            return JSONResponse(status_code=400, content={"error": "Invalid JSON", "details": str(pe), "version": CODE_VERSION})
 
-        # Housekeeping: purge 1h+ old entries (by first-bar time)
+        # Extract + log key parts
+        sym, tf = _extract_sym_tf(payload)
+        first_bar_dt = parse_first_bar_time(payload)
+        if not sym or not tf or not first_bar_dt:
+            return JSONResponse(status_code=400, content={"error": "Missing sym/tf/bars[0].t", "version": CODE_VERSION})
+        bar_sec = timeframe_to_seconds(tf)
+        tol = compute_tolerance_seconds(bar_sec)
+        key = canonical_key(sym, tf, first_bar_dt, bar_sec)
+        now = _now_utc()
+        print(f"🔑 Key={key} | tol_sec={tol} | first_bar_dt={first_bar_dt.isoformat()} | now_utc={now.isoformat()} | Δ={(now-first_bar_dt).total_seconds():.0f}s")
+
+        # Housekeeping
         clean_cache()
 
-        # Try cache first (time-only policy)
+        # Try cache
         cached = find_cached_answer(payload)
         if isinstance(cached, (int, float)):
-            prob = min(1.0, max(0.0, float(cached)))
-            print(f"✅ Returning CACHED probability: {prob:.4f}")
-            return {"probability": prob, "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
+            print(f"🔁 Already have result for response — key={key} prob={cached:.4f}")
+            return {"probability": float(cached), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
 
-        # Miss → call model
+        # In-flight dedupe (proximity bucket)
+        prox_key = inflight_bucket_key(sym, tf, first_bar_dt, bar_sec)
+        leader, fut = await inflight_acquire(prox_key)
+        if not leader:
+            print(f"⏳ In-flight pending — waiting for leader (prox_key={prox_key})")
+            try:
+                # Wait up to 5s; afterwards, re-check cache and possibly compute
+                prob = await asyncio.wait_for(fut, timeout=5.0)
+                print(f"🔁 Already have result for response (in-flight reuse) — key={key} prob={prob:.4f}")
+                return {"probability": float(prob), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit_inflight"}
+            except asyncio.TimeoutError:
+                print(f"⏱️ In-flight wait timed out (prox_key={prox_key}); rechecking cache...")
+                cached2 = find_cached_answer(payload)
+                if isinstance(cached2, (int, float)):
+                    print(f"🔁 Already have result for response (post-timeout cache) — key={key} prob={cached2:.4f}")
+                    return {"probability": float(cached2), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
+                # proceed as ad-hoc leader
+
+        # Leader path — compute with GPT (offload blocking call to a thread)
         compact_json = json.dumps(payload, separators=(",", ":"))
 
         system_prompt_primary = (
@@ -309,13 +332,14 @@ If conditions show compression, choppy movement, or contradictory higher timefra
 """
         )
         args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
-        resp = auto_heal_and_call(args)
-        reply = (resp.choices[0].message.content or "").strip()
+        try:
+            resp = await asyncio.to_thread(auto_heal_and_call, args)
+            reply = (resp.choices[0].message.content or "").strip()
+            prob = extract_probability(reply)
 
-        prob = extract_probability(reply)
-        if prob is None:
-            system_prompt_retry = (
-               """
+            if prob is None:
+                system_prompt_retry = (
+                   """
 You are an experienced market analyst.
 Analyze the provided JSON of technical and structural indicators.
 
@@ -328,28 +352,32 @@ Interpret the data holistically.
 If conditions indicate clear directional momentum and higher timeframe alignment, lean toward TAKE.
 If conditions show compression, choppy movement, or contradictory higher timeframe structure, lean toward SKIP.Return a single probability in [0,1] based on these factors. No text, only the probability.
 """
-            )
-            args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
-            resp2 = auto_heal_and_call(args_retry)
-            reply2 = (resp2.choices[0].message.content or "").strip()
-            prob = extract_probability(reply2)
-
-        if prob is None:
-            msg = "Model did not return a numeric probability"
-            print(f"⚠️ {msg}. Using fallback.")
-            if STRICT_FAIL_ON_UNPARSABLE:
-                return JSONResponse(
-                    status_code=502,
-                    content={"error": msg, "version": CODE_VERSION, "model": MODEL_NAME, "cache": "miss"},
                 )
-            prob = 0.5  # deterministic neutral fallback
+                args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
+                resp2 = await asyncio.to_thread(auto_heal_and_call, args_retry)
+                reply2 = (resp2.choices[0].message.content or "").strip()
+                prob = extract_probability(reply2)
 
-        # Clamp and store (no body saved)
-        prob = min(1.0, max(0.0, float(prob)))
-        add_cache_record(payload, prob)
+            if prob is None:
+                msg = "Model did not return a numeric probability"
+                print(f"⚠️ {msg}. Using fallback.")
+                if STRICT_FAIL_ON_UNPARSABLE:
+                    await inflight_finish(prox_key, err=RuntimeError(msg))
+                    return JSONResponse(status_code=502, content={"error": msg, "version": CODE_VERSION, "model": MODEL_NAME, "cache": "miss"})
+                prob = 0.5
 
-        print(f"✅ Final probability (NEW): {prob:.4f}")
-        return {"probability": prob, "version": CODE_VERSION, "model": MODEL_NAME, "cache": "miss"}
+            prob = min(1.0, max(0.0, float(prob)))
+            stored_key = add_cache_record(payload, prob)
+            await inflight_finish(prox_key, result=prob)
+
+            print(f"✅ Final probability (NEW) — key={stored_key} prob={prob:.4f}")
+            return {"probability": prob, "version": CODE_VERSION, "model": MODEL_NAME, "cache": "miss"}
+
+        except Exception as e:
+            await inflight_finish(prox_key, err=e)
+            print("❌ Unhandled ERROR during GPT call:", str(e))
+            traceback.print_exc()
+            return JSONResponse(status_code=500, content={"error": str(e), "version": CODE_VERSION})
 
     except BadRequestError as e:
         print("❌ OpenAI BadRequestError:", str(e))
