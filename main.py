@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
-CODE_VERSION = "v1.11."
+CODE_VERSION = "v1.12."
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -321,14 +321,14 @@ async def evaluate(request: Request):
 You are an experienced market analyst.
 Analyze the provided JSON of technical and structural indicators.
 
-Your goal is to evaluate if current conditions favor entering a trade (TAKE>0) or avoiding it (SKIP-0).
+Your goal is to evaluate if current conditions favor entering a trade (TAKE=1) or avoiding it (SKIP=0).
 Consider:
 - Signal timeframe: SMA cross and trend, RSI level and slope, ADX strength.
 - Higher timeframe: alignment of SMA, RSI, and ADX.
 - Structural filters: InsideBarCluster, ATRCompression, SwingProximityATR, SidewayStructure, HTF_RSIZone.
 Interpret the data holistically. 
 If conditions indicate clear directional momentum and higher timeframe alignment, lean toward TAKE.
-If conditions show compression, choppy movement, or contradictory higher timeframe structure, lean toward SKIP.Return a single probability in [0,1] based on these factors. No text, only the probability.
+If conditions show compression, choppy movement, or contradictory higher timeframe structure, lean toward SKIP.Return a single value 1 or 0 based on these factors. No text, only the value.
 """
         )
         args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
@@ -343,14 +343,14 @@ If conditions show compression, choppy movement, or contradictory higher timefra
 You are an experienced market analyst.
 Analyze the provided JSON of technical and structural indicators.
 
-Your goal is to evaluate if current conditions favor entering a trade (TAKE>0) or avoiding it (SKIP-0).
+Your goal is to evaluate if current conditions favor entering a trade (TAKE=1) or avoiding it (SKIP=0).
 Consider:
 - Signal timeframe: SMA cross and trend, RSI level and slope, ADX strength.
 - Higher timeframe: alignment of SMA, RSI, and ADX.
 - Structural filters: InsideBarCluster, ATRCompression, SwingProximityATR, SidewayStructure, HTF_RSIZone.
 Interpret the data holistically. 
 If conditions indicate clear directional momentum and higher timeframe alignment, lean toward TAKE.
-If conditions show compression, choppy movement, or contradictory higher timeframe structure, lean toward SKIP.Return a single probability in [0,1] based on these factors. No text, only the probability.
+If conditions show compression, choppy movement, or contradictory higher timeframe structure, lean toward SKIP.Return a single value 1 or 0 based on these factors. No text, only the value.
 """
                 )
                 args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
@@ -390,3 +390,4 @@ If conditions show compression, choppy movement, or contradictory higher timefra
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
+
