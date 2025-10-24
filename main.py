@@ -318,17 +318,20 @@ async def evaluate(request: Request):
 
         system_prompt_primary = (
             """
-You are an experienced market analyst.
-Analyze the provided JSON of technical and structural indicators.
-
-Your goal is to evaluate if current conditions favor entering a trade (TAKE=1) or avoiding it (SKIP=0).
-Consider:
-- Signal timeframe: SMA cross and trend, RSI level and slope, ADX strength.
-- Higher timeframe: alignment of SMA, RSI, and ADX.
-- Structural filters: InsideBarCluster, ATRCompression, SwingProximityATR, SidewayStructure, HTF_RSIZone.
-Interpret the data holistically. 
-If conditions indicate clear directional momentum and higher timeframe alignment, lean toward TAKE.
-If conditions show compression, choppy movement, or contradictory higher timeframe structure, lean toward SKIP.Return a single value 1 or 0 based on these factors. No text, only the value.
+Trade Setup Evaluation (Multi-Timeframe Strategy)
+I am an expert in quantitative market strategies with a specialization in multi-timeframe analysis. I’m providing you with a trade candidate that has already passed initial quantitative filters — including RSI 21, which ensures momentum alignment (RSI ≥ 52 for longs, RSI ≤ 47 for shorts). You do not need to re-evaluate RSI or ADX.
+Your task is to determine whether the trade should be taken=1 or skipped=0, based strictly on the following 3 technical criteria:
+	1. SMA50 Direction
+The 50-period simple moving average on the entry timeframe must be clearly angled in the direction of the trade. If the slope is flat, weak, or against the trade, this counts as a misalignment.
+	2. Local Price Structure
+The local structure should show a clean directional impulse — such as a clear breakout, trending sequence, or consistent candle flow in the trade direction. Sideways movement, noise, or range-bound price action is considered a misalignment.
+	3. Higher Timeframe Confirmation (HTF)
+The structure or directional bias on the higher timeframe must support the trade direction. This includes trend alignment, momentum behavior, or price positioning relative to key levels (e.g., higher highs/lows for longs, lower highs/lows for shorts). A higher timeframe that contradicts the trade direction is a misalignment.
+Evaluation Rules:
+	• If all 3 criteria align, the trade is considered valid — label it as: take=1
+	• If only 2 out of 3 align, and 1 is questionable — the trade is still acceptable — label it as: take=1
+	• If 2 or more criteria are misaligned, the trade should be skipped — label it as: skip=0
+Return a single value 1 or 0 based on these factors. No text, only the value.
 """
         )
         args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
@@ -340,17 +343,19 @@ If conditions show compression, choppy movement, or contradictory higher timefra
             if prob is None:
                 system_prompt_retry = (
                    """
-You are an experienced market analyst.
-Analyze the provided JSON of technical and structural indicators.
-
-Your goal is to evaluate if current conditions favor entering a trade (TAKE=1) or avoiding it (SKIP=0).
-Consider:
-- Signal timeframe: SMA cross and trend, RSI level and slope, ADX strength.
-- Higher timeframe: alignment of SMA, RSI, and ADX.
-- Structural filters: InsideBarCluster, ATRCompression, SwingProximityATR, SidewayStructure, HTF_RSIZone.
-Interpret the data holistically. 
-If conditions indicate clear directional momentum and higher timeframe alignment, lean toward TAKE.
-If conditions show compression, choppy movement, or contradictory higher timeframe structure, lean toward SKIP.Return a single value 1 or 0 based on these factors. No text, only the value.
+Trade Setup Evaluation (Multi-Timeframe Strategy)
+I am an expert in quantitative market strategies with a specialization in multi-timeframe analysis. I’m providing you with a trade candidate that has already passed initial quantitative filters — including RSI 21, which ensures momentum alignment (RSI ≥ 52 for longs, RSI ≤ 47 for shorts). You do not need to re-evaluate RSI or ADX.
+Your task is to determine whether the trade should be taken=1 or skipped=0, based strictly on the following 3 technical criteria:
+	1. SMA50 Direction
+The 50-period simple moving average on the entry timeframe must be clearly angled in the direction of the trade. If the slope is flat, weak, or against the trade, this counts as a misalignment.
+	2. Local Price Structure
+The local structure should show a clean directional impulse — such as a clear breakout, trending sequence, or consistent candle flow in the trade direction. Sideways movement, noise, or range-bound price action is considered a misalignment.
+	3. Higher Timeframe Confirmation (HTF)
+The structure or directional bias on the higher timeframe must support the trade direction. This includes trend alignment, momentum behavior, or price positioning relative to key levels (e.g., higher highs/lows for longs, lower highs/lows for shorts). A higher timeframe that contradicts the trade direction is a misalignment.
+Evaluation Rules:
+	• If all 3 criteria align, the trade is considered valid — label it as: take=1
+	• If only 2 out of 3 align, and 1 is questionable — the trade is still acceptable — label it as: take=1
+	• If 2 or more criteria are misaligned, the trade should be skipped — label it as: skip=0.Return a single value 1 or 0 based on these factors. No text, only the value.
 """
                 )
                 args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
@@ -390,4 +395,5 @@ If conditions show compression, choppy movement, or contradictory higher timefra
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
+
 
