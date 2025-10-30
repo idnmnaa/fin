@@ -45,6 +45,10 @@ Return a single value 1 or 0 based on these factors. No text, only the value.
 )
 SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip()
 
+# Show the effective SYSTEM_PROMPT once at startup
+if os.getenv("SHOW_PROMPT_ON_START", "1").strip() == "1":
+    print("\n===== SYSTEM_PROMPT (effective) =====\n" + SYSTEM_PROMPT + "\n===== END SYSTEM_PROMPT =====\n")
+
 # ===================== CACHE (GPTarr) =====================
 # Structure: {sym, tf, time (iso), time_dt (UTC), answer, key, ts_added}
 GPTarr: List[Dict[str, Any]] = []
