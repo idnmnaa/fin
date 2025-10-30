@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
-CODE_VERSION = "v1.12."
+CODE_VERSION = "v1.13."
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -17,6 +17,33 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini").strip()
 STRICT_FAIL_ON_UNPARSABLE = os.getenv("STRICT_FAIL_ON_UNPARSABLE", "0").strip() == "1"
+
+# ===================== SYSTEM PROMPT (single source) =====================
+# You can override via env var SYSTEM_PROMPT. The default below mirrors the original inline prompt.
+DEFAULT_SYSTEM_PROMPT = (
+    """
+You are a trade evaluation assistant using a 3-rule decision model.
+This trade setup already passed all filters 
+(RSI, ATR, SMA50 cross, structural filters, obv.). 
+Do NOT re-evaluate them.
+For each trade input, determine whether the trade should be TAKE=1 or SKIP=0.
+Rules:
+1.	SMA50 Slope must support the trade direction.
+•	BUY: SMA50 should be clearly sloping upward.
+•	SELL: SMA50 should be clearly sloping downward.
+2.	Price Structure must support the trade direction.
+•	BUY: Look for higher highs and higher lows.
+•	SELL: Look for lower highs and lower lows.
+3.	HTF Bias must support the trade direction.
+•	BUY: HTF trend or momentum should be bullish.
+•	SELL: HTF trend or momentum should be bearish.
+Decision Logic:
+•	If at least 2 out of the 3 rules align with the trade direction, return TAKE=1.
+•	Otherwise, return SKIP=0.
+Return a single value 1 or 0 based on these factors. No text, only the value.
+"""
+)
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip()
 
 # ===================== CACHE (GPTarr) =====================
 # Structure: {sym, tf, time (iso), time_dt (UTC), answer, key, ts_added}
@@ -316,24 +343,7 @@ async def evaluate(request: Request):
         # Leader path — compute with GPT (offload blocking call to a thread)
         compact_json = json.dumps(payload, separators=(",", ":"))
 
-        system_prompt_primary = (
-            """
-Trade Setup Evaluation (Multi-Timeframe Strategy)
-I am an expert in quantitative market strategies with a specialization in multi-timeframe analysis. I’m providing you with a trade candidate that has already passed initial quantitative filters — including RSI 21, which ensures momentum alignment (RSI ≥ 52 for longs, RSI ≤ 47 for shorts). You do not need to re-evaluate RSI or ADX.
-Your task is to determine whether the trade should be taken=1 or skipped=0, based strictly on the following 3 technical criteria:
-	1. SMA50 Direction
-The 50-period simple moving average on the entry timeframe must be clearly angled in the direction of the trade. If the slope is flat, weak, or against the trade, this counts as a misalignment.
-	2. Local Price Structure
-The local structure should show a clean directional impulse — such as a clear breakout, trending sequence, or consistent candle flow in the trade direction. Sideways movement, noise, or range-bound price action is considered a misalignment.
-	3. Higher Timeframe Confirmation (HTF)
-The structure or directional bias on the higher timeframe must support the trade direction. This includes trend alignment, momentum behavior, or price positioning relative to key levels (e.g., higher highs/lows for longs, lower highs/lows for shorts). A higher timeframe that contradicts the trade direction is a misalignment.
-Evaluation Rules:
-	• If all 3 criteria align, the trade is considered valid — label it as: take=1
-	• If only 2 out of 3 align, and 1 is questionable — the trade is still acceptable — label it as: take=1
-	• If 2 or more criteria are misaligned, the trade should be skipped — label it as: skip=0
-Return a single value 1 or 0 based on these factors. No text, only the value.
-"""
-        )
+        system_prompt_primary = SYSTEM_PROMPT
         args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
         try:
             resp = await asyncio.to_thread(auto_heal_and_call, args)
@@ -341,24 +351,7 @@ Return a single value 1 or 0 based on these factors. No text, only the value.
             prob = extract_probability(reply)
 
             if prob is None:
-                system_prompt_retry = (
-                   """
-Trade Setup Evaluation (Multi-Timeframe Strategy)
-I am an expert in quantitative market strategies with a specialization in multi-timeframe analysis. I’m providing you with a trade candidate that has already passed initial quantitative filters — including RSI 21, which ensures momentum alignment (RSI ≥ 52 for longs, RSI ≤ 47 for shorts). You do not need to re-evaluate RSI or ADX.
-Your task is to determine whether the trade should be taken=1 or skipped=0, based strictly on the following 3 technical criteria:
-	1. SMA50 Direction
-The 50-period simple moving average on the entry timeframe must be clearly angled in the direction of the trade. If the slope is flat, weak, or against the trade, this counts as a misalignment.
-	2. Local Price Structure
-The local structure should show a clean directional impulse — such as a clear breakout, trending sequence, or consistent candle flow in the trade direction. Sideways movement, noise, or range-bound price action is considered a misalignment.
-	3. Higher Timeframe Confirmation (HTF)
-The structure or directional bias on the higher timeframe must support the trade direction. This includes trend alignment, momentum behavior, or price positioning relative to key levels (e.g., higher highs/lows for longs, lower highs/lows for shorts). A higher timeframe that contradicts the trade direction is a misalignment.
-Evaluation Rules:
-	• If all 3 criteria align, the trade is considered valid — label it as: take=1
-	• If only 2 out of 3 align, and 1 is questionable — the trade is still acceptable — label it as: take=1
-	• If 2 or more criteria are misaligned, the trade should be skipped — label it as: skip=0.Return a single value 1 or 0 based on these factors. No text, only the value.
-"""
-                )
-                args_retry = build_args(system_prompt_retry, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
+                args_retry = build_args(SYSTEM_PROMPT, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
                 resp2 = await asyncio.to_thread(auto_heal_and_call, args_retry)
                 reply2 = (resp2.choices[0].message.content or "").strip()
                 prob = extract_probability(reply2)
@@ -395,5 +388,4 @@ Evaluation Rules:
 @app.get("/", response_class=PlainTextResponse)
 async def root():
     return f"OK: {CODE_VERSION}\n"
-
 
