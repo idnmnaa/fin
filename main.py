@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
-CODE_VERSION = "v1.14.01"
+CODE_VERSION = "v1.14.02"
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -186,9 +186,9 @@ def floor_to_bar(dt: datetime, bar_sec: int) -> datetime:
     floored = epoch - (epoch % max(1, bar_sec))
     return datetime.fromtimestamp(floored, tz=timezone.utc)
 
-def canonical_key(sym: str, tf: str, first_bar_dt: datetime, bar_sec: int) -> str:
+def canonical_key(sym: str, tf: str, pid: str, first_bar_dt: datetime, bar_sec: int) -> str:
     base_dt = floor_to_bar(first_bar_dt, bar_sec)
-    return f"{sym}|{tf}|{base_dt.isoformat()}"
+    return f"{sym}|{tf}|{pid}|{base_dt.isoformat()}"
 
 def compute_tolerance_seconds(bar_sec: int) -> int:
     return max(30, min(180, bar_sec // 2 if bar_sec > 0 else 60))
@@ -202,9 +202,17 @@ def _extract_sym_tf(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[st
     if isinstance(tf, str):  tf  = tf.strip().upper()
     return sym, tf
 
+def _extract_pid(payload: Dict[str, Any]) -> str:
+    meta = payload.get("meta") or {}
+    pid = payload.get("pid") or meta.get("pid") or ""
+    if isinstance(pid, str):
+        pid = pid.strip().lower()
+    return pid or "default"
+
 # ----------------- Cache lookup/store/clean -----------------
 def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
     sym, tf = _extract_sym_tf(payload)
+    pid = _extract_pid(payload)
     if not sym or not tf:
         return None
     first_bar_dt = parse_first_bar_time(payload)
@@ -213,7 +221,7 @@ def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
 
     bar_sec = timeframe_to_seconds(tf)
     tol = compute_tolerance_seconds(bar_sec)
-    key_exact = canonical_key(sym, tf, first_bar_dt, bar_sec)
+    key_exact = canonical_key(sym, tf, pid, first_bar_dt, bar_sec)
 
     with _GPTARR_LOCK:
         # 1) Exact key match
@@ -227,6 +235,8 @@ def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
         fb_epoch = int(first_bar_dt.timestamp())
         for row in reversed(GPTarr):
             if row.get("sym") != sym or row.get("tf") != tf:
+                continue
+            if row.get("pid") != pid:
                 continue
             row_dt = row.get("time_dt")
             if not isinstance(row_dt, datetime):
@@ -242,14 +252,16 @@ def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
 
 def add_cache_record(payload: Dict[str, Any], answer: float) -> str:
     sym, tf = _extract_sym_tf(payload)
+    pid = _extract_pid(payload)
     first_bar_dt = parse_first_bar_time(payload)
     if not sym or not tf or not first_bar_dt:
         return "N/A"
     bar_sec = timeframe_to_seconds(tf)
-    key = canonical_key(sym, tf, first_bar_dt, bar_sec)
+    key = canonical_key(sym, tf, pid, first_bar_dt, bar_sec)
     row = {
         "sym": sym,
         "tf": tf,
+        "pid": pid,
         "time": first_bar_dt.isoformat(),
         "time_dt": first_bar_dt,
         "answer": float(answer),
@@ -275,14 +287,14 @@ def clean_cache() -> None:
 _INFLIGHT: Dict[str, asyncio.Future] = {}
 _INFLIGHT_LOCK = asyncio.Lock()
 
-def inflight_bucket_key(sym: str, tf: str, first_bar_dt: datetime, bar_sec: int) -> str:
+def inflight_bucket_key(sym: str, tf: str, pid: str, first_bar_dt: datetime, bar_sec: int) -> str:
     """
     Proximity bucket (coarser than cache key) so tiny time differences coalesce:
     bucket by round(epoch / tol), where tol = half a bar (clamped 30..180).
     """
     tol = compute_tolerance_seconds(bar_sec)
     buck = int(round(first_bar_dt.timestamp() / tol))
-    return f"{sym}|{tf}|prox|{tol}|{buck}"
+    return f"{sym}|{tf}|{pid}|prox|{tol}|{buck}"
 
 async def inflight_acquire(key: str) -> Tuple[bool, asyncio.Future]:
     async with _INFLIGHT_LOCK:
@@ -365,12 +377,13 @@ async def evaluate(request: Request):
 
         # Extract + log key parts
         sym, tf = _extract_sym_tf(payload)
+        pid = _extract_pid(payload)
         first_bar_dt = parse_first_bar_time(payload)
         if not sym or not tf or not first_bar_dt:
             return JSONResponse(status_code=400, content={"error": "Missing sym/tf/bars[0].t", "version": CODE_VERSION})
         bar_sec = timeframe_to_seconds(tf)
         tol = compute_tolerance_seconds(bar_sec)
-        key = canonical_key(sym, tf, first_bar_dt, bar_sec)
+        key = canonical_key(sym, tf, pid, first_bar_dt, bar_sec)
         now = _now_utc()
         print(f"🔑 Key={key} | tol_sec={tol} | first_bar_dt={first_bar_dt.isoformat()} | now_utc={now.isoformat()} | Δ={(now-first_bar_dt).total_seconds():.0f}s")
 
@@ -387,7 +400,7 @@ async def evaluate(request: Request):
             return resp_out
 
         # In-flight dedupe (proximity bucket)
-        prox_key = inflight_bucket_key(sym, tf, first_bar_dt, bar_sec)
+        prox_key = inflight_bucket_key(sym, tf, pid, first_bar_dt, bar_sec)
         leader, fut = await inflight_acquire(prox_key)
         if not leader:
             print(f"⏳ In-flight pending — waiting for leader (prox_key={prox_key})")
@@ -415,7 +428,7 @@ async def evaluate(request: Request):
 
         prompt_return = PROMPT_RETURN_EXPLAIN if gpt_exp else PROMPT_RETURN_PLAIN
 
-        pid = payload.get("pid")
+        pid = payload.get("pid") or (payload.get("meta") or {}).get("pid")
         pid_label = str(pid or "").strip().lower()
         system_prompt_primary = (SYSTEM_PROMPT_S2 if pid == "s2" else SYSTEM_PROMPT_m50) + "\n" + prompt_return
         prompt_label = "S2_PROMPT" if pid_label == "s2" else "SYSTEM_PROMPT_m50"
