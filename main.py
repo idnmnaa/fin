@@ -22,25 +22,21 @@ STRICT_FAIL_ON_UNPARSABLE = os.getenv("STRICT_FAIL_ON_UNPARSABLE", "0").strip() 
 # You can override via env var SYSTEM_PROMPT. The default below mirrors the original inline prompt.
 DEFAULT_SYSTEM_PROMPT = (
     """
-You are a trade evaluation assistant using a 3-rule decision model.
-This trade setup already passed all filters 
-(RSI, ATR, SMA50 cross, structural filters, obv.). 
-Do NOT re-evaluate them.
-For each trade input, determine whether the trade should be TAKE=1 or SKIP=0.
-Rules:
-1.	SMA50 Slope must support the trade direction.
-•	BUY: SMA50 should be clearly sloping upward.
-•	SELL: SMA50 should be clearly sloping downward.
-2.	Price Structure must support the trade direction.
-•	BUY: Look for higher highs and higher lows.
-•	SELL: Look for lower highs and lower lows.
-3.	HTF Bias must support the trade direction.
-•	BUY: HTF trend or momentum should be bullish.
-•	SELL: HTF trend or momentum should be bearish.
-Decision Logic:
-•	If at least 2 out of the 3 rules align with the trade direction, return TAKE=1.
-•	Otherwise, return SKIP=0.
-Return a single value 1 or 0 based on these factors. No text, only the value.
+You are a trade evaluation assistant. The setup already passed all filters (RSI/ATR/SMA cross/structure/OBV). Do NOT re-evaluate those filters.
+Use ONLY the provided JSON fields (bars, htf_bars, direction, market). Decide TAKE=1 or SKIP=0.
+
+Rules (3 total):
+1) Trend/Slope: infer short-term slope from the last 3 closed bars in "bars".
+   - BUY: closes and/or highs are rising overall.
+   - SELL: closes and/or lows are falling overall.
+2) Price structure: check higher highs & higher lows (BUY) or lower highs & lower lows (SELL) over the last 4 closed bars in "bars".
+3) HTF bias: use the last 3 closed bars in "htf_bars".
+   - BUY: HTF closes show upward bias.
+   - SELL: HTF closes show downward bias.
+
+Decision:
+- If at least 2 of 3 rules align with the trade direction, return 1.
+- Otherwise return 0.
 """
 )
 SYSTEM_PROMPT_m50 = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip()
@@ -56,12 +52,18 @@ PROMPT_RETURN_EXPLAIN = (
     "explain must be one short sentence, no fluff."
 )
 
+# Token budgets: explain needs room for text, plain can stay tight.
+MAX_TOK_PLAIN_PRIMARY = 3
+MAX_TOK_PLAIN_RETRY = 6
+MAX_TOK_EXPLAIN_PRIMARY = 64
+MAX_TOK_EXPLAIN_RETRY = 96
+
 # Show the effective final prompt once after it is fully built
 _SHOW_PROMPT_ON_START = os.getenv("SHOW_PROMPT_ON_START", "1").strip() == "1"
 _PROMPT_SHOWN = False
 
 # ===================== CACHE (GPTarr) =====================
-# Structure: {sym, tf, time (iso), time_dt (UTC), answer, key, ts_added}
+# Structure: {sym, tf, pid, time (iso), time_dt (UTC), answer, explain, key, ts_added}
 GPTarr: List[Dict[str, Any]] = []
 _GPTARR_LOCK = threading.Lock()
 _MAX_AGE = timedelta(hours=1)
@@ -148,6 +150,16 @@ def extract_prob_and_explain(text: str) -> Tuple[Optional[float], Optional[str]]
         explain = explain.rstrip("}").strip()
     return prob, explain
 
+def fallback_explain_from_text(text: str) -> Optional[str]:
+    s = (text or "").strip()
+    if not s:
+        return None
+    s = s.strip("{}").strip()
+    s = re.sub(r"(?i)\bprob(?:ability)?\s*[:=]\s*[01](?:\.0+)?\s*[;,\s]*", "", s)
+    s = re.sub(r"(?i)\bexplain\s*[:=]\s*", "", s)
+    s = s.strip(" ;,")
+    return s or None
+
 _TF_RE = re.compile(r"^\s*([mMhH])\s*([0-9]+)\s*$")
 
 def timeframe_to_seconds(tf: Optional[str]) -> int:
@@ -210,7 +222,7 @@ def _extract_pid(payload: Dict[str, Any]) -> str:
     return pid or "default"
 
 # ----------------- Cache lookup/store/clean -----------------
-def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
+def find_cached_answer(payload: Dict[str, Any]) -> Optional[Tuple[float, str]]:
     sym, tf = _extract_sym_tf(payload)
     pid = _extract_pid(payload)
     if not sym or not tf:
@@ -229,7 +241,7 @@ def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
             if row.get("key") == key_exact and isinstance(row.get("answer"), (int, float)):
                 prob = float(row["answer"])
                 print(f"💾 Cache HIT (exact) — key={key_exact} prob={prob:.4f}")
-                return prob
+                return prob, str(row.get("explain") or "")
 
         # 2) Proximity by sym/tf and |dt diff| ≤ tol
         fb_epoch = int(first_bar_dt.timestamp())
@@ -247,10 +259,10 @@ def find_cached_answer(payload: Dict[str, Any]) -> Optional[float]:
                     prob = float(ans)
                     print(f"💾 Cache HIT (prox ±{tol}s) — sym={sym} tf={tf} "
                           f"req={first_bar_dt.isoformat()} cached={row_dt.isoformat()} prob={prob:.4f}")
-                    return prob
+                    return prob, str(row.get("explain") or "")
     return None
 
-def add_cache_record(payload: Dict[str, Any], answer: float) -> str:
+def add_cache_record(payload: Dict[str, Any], answer: float, explain: str) -> str:
     sym, tf = _extract_sym_tf(payload)
     pid = _extract_pid(payload)
     first_bar_dt = parse_first_bar_time(payload)
@@ -265,6 +277,7 @@ def add_cache_record(payload: Dict[str, Any], answer: float) -> str:
         "time": first_bar_dt.isoformat(),
         "time_dt": first_bar_dt,
         "answer": float(answer),
+        "explain": explain or "",
         "key": key,
         "ts_added": _now_utc().isoformat(),
     }
@@ -305,7 +318,7 @@ async def inflight_acquire(key: str) -> Tuple[bool, asyncio.Future]:
         _INFLIGHT[key] = fut
         return True, fut       # leader
 
-async def inflight_finish(key: str, result: float = None, err: Exception = None):
+async def inflight_finish(key: str, result: Tuple[float, str] = None, err: Exception = None):
     async with _INFLIGHT_LOCK:
         fut = _INFLIGHT.pop(key, None)
     if fut and not fut.done():
@@ -392,11 +405,13 @@ async def evaluate(request: Request):
 
         # Try cache
         cached = find_cached_answer(payload)
-        if isinstance(cached, (int, float)):
+        if isinstance(cached, tuple):
+            cached_prob, cached_explain = cached
+            cached = cached_prob
             print(f"🔁 Already have result for response — key={key} prob={cached:.4f}")
             resp_out = {"probability": float(cached), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
             if gpt_exp:
-                resp_out["explain"] = ""
+                resp_out["explain"] = cached_explain or ""
             return resp_out
 
         # In-flight dedupe (proximity bucket)
@@ -406,20 +421,22 @@ async def evaluate(request: Request):
             print(f"⏳ In-flight pending — waiting for leader (prox_key={prox_key})")
             try:
                 # Wait up to 5s; afterwards, re-check cache and possibly compute
-                prob = await asyncio.wait_for(fut, timeout=5.0)
+                prob, cached_explain = await asyncio.wait_for(fut, timeout=5.0)
                 print(f"🔁 Already have result for response (in-flight reuse) — key={key} prob={prob:.4f}")
                 resp_out = {"probability": float(prob), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit_inflight"}
                 if gpt_exp:
-                    resp_out["explain"] = ""
+                    resp_out["explain"] = cached_explain or ""
                 return resp_out
             except asyncio.TimeoutError:
                 print(f"⏱️ In-flight wait timed out (prox_key={prox_key}); rechecking cache...")
                 cached2 = find_cached_answer(payload)
-                if isinstance(cached2, (int, float)):
+                if isinstance(cached2, tuple):
+                    cached_prob, cached_explain = cached2
+                    cached2 = cached_prob
                     print(f"🔁 Already have result for response (post-timeout cache) — key={key} prob={cached2:.4f}")
                     resp_out = {"probability": float(cached2), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
                     if gpt_exp:
-                        resp_out["explain"] = ""
+                        resp_out["explain"] = cached_explain or ""
                     return resp_out
                 # proceed as ad-hoc leader
 
@@ -437,7 +454,9 @@ async def evaluate(request: Request):
             print(f"\n===== {prompt_label} (effective) =====\n{system_prompt_primary}\n===== END {prompt_label} =====\n")
             _PROMPT_SHOWN = True
         print(f"Using prompt: {prompt_label} (pid={pid!r}, gpt_exp={gpt_exp})")
-        args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
+        max_primary = MAX_TOK_EXPLAIN_PRIMARY if gpt_exp else MAX_TOK_PLAIN_PRIMARY
+        max_retry = MAX_TOK_EXPLAIN_RETRY if gpt_exp else MAX_TOK_PLAIN_RETRY
+        args = build_args(system_prompt_primary, compact_json, max_tok_primary=max_primary, max_tok_retry=max_retry, retry=False)
         try:
             resp = await asyncio.to_thread(auto_heal_and_call, args)
             reply = (resp.choices[0].message.content or "").strip()
@@ -448,7 +467,7 @@ async def evaluate(request: Request):
                 prob = extract_probability(reply)
 
             if prob is None:
-                args_retry = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
+                args_retry = build_args(system_prompt_primary, compact_json, max_tok_primary=max_primary, max_tok_retry=max_retry, retry=True)
                 resp2 = await asyncio.to_thread(auto_heal_and_call, args_retry)
                 reply2 = (resp2.choices[0].message.content or "").strip()
                 if gpt_exp:
@@ -465,8 +484,14 @@ async def evaluate(request: Request):
                 prob = 0.5
 
             prob = min(1.0, max(0.0, float(prob)))
-            stored_key = add_cache_record(payload, prob)
-            await inflight_finish(prox_key, result=prob)
+            if gpt_exp and not explain:
+                retry_text = reply2 if "reply2" in locals() else ""
+                explain = fallback_explain_from_text(reply) or fallback_explain_from_text(retry_text) or ""
+            if gpt_exp:
+                print(f"GPT reply raw: {reply}")
+                print(f"GPT explain parsed: {explain!r}")
+            stored_key = add_cache_record(payload, prob, explain or "")
+            await inflight_finish(prox_key, result=(prob, explain or ""))
 
             print(f"✅ Final probability (NEW) — key={stored_key} prob={prob:.4f}")
             resp_out = {"probability": prob, "version": CODE_VERSION, "model": MODEL_NAME, "cache": "miss"}
