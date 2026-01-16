@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
-CODE_VERSION = "v1.14.02"
+CODE_VERSION = "v1.14.03"
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -58,9 +58,8 @@ MAX_TOK_PLAIN_RETRY = 6
 MAX_TOK_EXPLAIN_PRIMARY = 64
 MAX_TOK_EXPLAIN_RETRY = 96
 
-# Show the effective final prompt once after it is fully built
+# Show the effective prompt for each request when enabled
 _SHOW_PROMPT_ON_START = os.getenv("SHOW_PROMPT_ON_START", "1").strip() == "1"
-_PROMPT_SHOWN = False
 
 # ===================== CACHE (GPTarr) =====================
 # Structure: {sym, tf, pid, time (iso), time_dt (UTC), answer, explain, key, ts_added}
@@ -87,7 +86,7 @@ def coerce_bool(val: Any) -> bool:
 
 def parse_json_strict_but_safe(body_bytes: bytes) -> dict:
     tail = body_bytes[-16:] if len(body_bytes) >= 16 else body_bytes
-    print(f"📦 Incoming bytes: len={len(body_bytes)} tail={repr(tail)}")
+    # print(f"📦 Incoming bytes: len={len(body_bytes)} tail={repr(tail)}")
     cleaned = body_bytes.replace(b"\x00", b"")
     start = cleaned.find(b"{")
     end = cleaned.rfind(b"}")
@@ -375,8 +374,8 @@ async def evaluate(request: Request):
     print(f"\n📥 New request — version: {CODE_VERSION}")
     try:
         body_bytes = await request.body()
-        preview = body_bytes[:400]
-        print("Raw request (first 400 bytes):", preview.decode("utf-8", errors="ignore"))
+        # preview = body_bytes[:400]
+        # print("Raw request (first 400 bytes):", preview.decode("utf-8", errors="ignore"))
 
         try:
             payload = parse_json_strict_but_safe(body_bytes)
@@ -407,12 +406,15 @@ async def evaluate(request: Request):
         cached = find_cached_answer(payload)
         if isinstance(cached, tuple):
             cached_prob, cached_explain = cached
-            cached = cached_prob
-            print(f"🔁 Already have result for response — key={key} prob={cached:.4f}")
-            resp_out = {"probability": float(cached), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
-            if gpt_exp:
-                resp_out["explain"] = cached_explain or ""
-            return resp_out
+            if gpt_exp and not cached_explain:
+                cached = None
+            else:
+                cached = cached_prob
+                print(f"🔁 Already have result for response — key={key} prob={cached:.4f}")
+                resp_out = {"probability": float(cached), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
+                if gpt_exp:
+                    resp_out["explain"] = cached_explain or ""
+                return resp_out
 
         # In-flight dedupe (proximity bucket)
         prox_key = inflight_bucket_key(sym, tf, pid, first_bar_dt, bar_sec)
@@ -432,16 +434,29 @@ async def evaluate(request: Request):
                 cached2 = find_cached_answer(payload)
                 if isinstance(cached2, tuple):
                     cached_prob, cached_explain = cached2
-                    cached2 = cached_prob
-                    print(f"🔁 Already have result for response (post-timeout cache) — key={key} prob={cached2:.4f}")
-                    resp_out = {"probability": float(cached2), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
-                    if gpt_exp:
-                        resp_out["explain"] = cached_explain or ""
-                    return resp_out
+                    if gpt_exp and not cached_explain:
+                        cached2 = None
+                    else:
+                        cached2 = cached_prob
+                        print(f"🔁 Already have result for response (post-timeout cache) — key={key} prob={cached2:.4f}")
+                        resp_out = {"probability": float(cached2), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
+                        if gpt_exp:
+                            resp_out["explain"] = cached_explain or ""
+                        return resp_out
                 # proceed as ad-hoc leader
 
         # Leader path — compute with GPT (offload blocking call to a thread)
-        compact_json = json.dumps(payload, separators=(",", ":"))
+        payload_for_model = dict(payload)
+        payload_for_model.pop("gpt_exp", None)
+        payload_for_model.pop("pid", None)
+        meta_for_model = dict(payload_for_model.get("meta") or {})
+        meta_for_model.pop("gpt_exp", None)
+        meta_for_model.pop("pid", None)
+        if meta_for_model:
+            payload_for_model["meta"] = meta_for_model
+        else:
+            payload_for_model.pop("meta", None)
+        compact_json = json.dumps(payload_for_model, separators=(",", ":"))
 
         prompt_return = PROMPT_RETURN_EXPLAIN if gpt_exp else PROMPT_RETURN_PLAIN
 
@@ -449,10 +464,8 @@ async def evaluate(request: Request):
         pid_label = str(pid or "").strip().lower()
         system_prompt_primary = (SYSTEM_PROMPT_S2 if pid == "s2" else SYSTEM_PROMPT_m50) + "\n" + prompt_return
         prompt_label = "S2_PROMPT" if pid_label == "s2" else "SYSTEM_PROMPT_m50"
-        global _PROMPT_SHOWN
-        if _SHOW_PROMPT_ON_START and not _PROMPT_SHOWN:
+        if _SHOW_PROMPT_ON_START:
             print(f"\n===== {prompt_label} (effective) =====\n{system_prompt_primary}\n===== END {prompt_label} =====\n")
-            _PROMPT_SHOWN = True
         print(f"Using prompt: {prompt_label} (pid={pid!r}, gpt_exp={gpt_exp})")
         max_primary = MAX_TOK_EXPLAIN_PRIMARY if gpt_exp else MAX_TOK_PLAIN_PRIMARY
         max_retry = MAX_TOK_EXPLAIN_RETRY if gpt_exp else MAX_TOK_PLAIN_RETRY
@@ -489,7 +502,7 @@ async def evaluate(request: Request):
                 explain = fallback_explain_from_text(reply) or fallback_explain_from_text(retry_text) or ""
             if gpt_exp:
                 print(f"GPT reply raw: {reply}")
-                print(f"GPT explain parsed: {explain!r}")
+                # print(f"GPT explain parsed: {explain!r}")
             stored_key = add_cache_record(payload, prob, explain or "")
             await inflight_finish(prox_key, result=(prob, explain or ""))
 
