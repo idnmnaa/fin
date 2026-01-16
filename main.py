@@ -7,7 +7,7 @@ from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
-CODE_VERSION = "v1.13."
+CODE_VERSION = "v1.14.01"
 print(f"🔁 Starting GPT signal evaluation server — code version: {CODE_VERSION}")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -43,11 +43,22 @@ Decision Logic:
 Return a single value 1 or 0 based on these factors. No text, only the value.
 """
 )
-SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip()
+SYSTEM_PROMPT_m50 = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip()
+SYSTEM_PROMPT_S2 = os.getenv("S2_PROMPT", DEFAULT_SYSTEM_PROMPT).strip()
 
-# Show the effective SYSTEM_PROMPT once at startup
-if os.getenv("SHOW_PROMPT_ON_START", "1").strip() == "1":
-    print("\n===== SYSTEM_PROMPT (effective) =====\n" + SYSTEM_PROMPT + "\n===== END SYSTEM_PROMPT =====\n")
+PROMPT_RETURN_PLAIN = (
+    "Return a single value 1 or 0 based on these factors. "
+    "No text, only the value."
+)
+PROMPT_RETURN_EXPLAIN = (
+    "Return format {prob:1|0; explain:<short factual reason>}. "
+    "prob must be a single 1 or 0 only. "
+    "explain must be one short sentence, no fluff."
+)
+
+# Show the effective final prompt once after it is fully built
+_SHOW_PROMPT_ON_START = os.getenv("SHOW_PROMPT_ON_START", "1").strip() == "1"
+_PROMPT_SHOWN = False
 
 # ===================== CACHE (GPTarr) =====================
 # Structure: {sym, tf, time (iso), time_dt (UTC), answer, key, ts_added}
@@ -62,6 +73,15 @@ def _now_utc() -> datetime:
 def is_nano_or_mini(model_name: str) -> bool:
     m = model_name.lower()
     return any(k in m for k in ["nano", "mini", "small"])
+
+def coerce_bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return val != 0
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "y", "on")
+    return False
 
 def parse_json_strict_but_safe(body_bytes: bytes) -> dict:
     tail = body_bytes[-16:] if len(body_bytes) >= 16 else body_bytes
@@ -93,6 +113,40 @@ def extract_probability(text: str) -> Optional[float]:
         except Exception:
             return None
     return None
+
+
+def extract_prob_and_explain(text: str) -> Tuple[Optional[float], Optional[str]]:
+    if not text:
+        return None, None
+    s = text.strip()
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            obj = json.loads(s)
+            prob = obj.get("prob") if "prob" in obj else obj.get("probability")
+            explain = obj.get("explain") or obj.get("reason")
+            if prob is not None:
+                try:
+                    prob = float(prob)
+                except Exception:
+                    prob = None
+            return prob, explain if isinstance(explain, str) else None
+        except Exception:
+            pass
+    prob = None
+    m = re.search(r"prob\s*[:=]\s*([01](?:\.0+)?)", s, re.IGNORECASE)
+    if m:
+        try:
+            prob = float(m.group(1))
+        except Exception:
+            prob = None
+    if prob is None:
+        prob = extract_probability(s)
+    explain = None
+    m2 = re.search(r"explain\s*[:=]\s*(.+)", s, re.IGNORECASE)
+    if m2:
+        explain = m2.group(1).strip()
+        explain = explain.rstrip("}").strip()
+    return prob, explain
 
 _TF_RE = re.compile(r"^\s*([mMhH])\s*([0-9]+)\s*$")
 
@@ -301,6 +355,9 @@ async def evaluate(request: Request):
 
         try:
             payload = parse_json_strict_but_safe(body_bytes)
+
+            meta = payload.get("meta") or {}
+            gpt_exp = coerce_bool(payload.get("gpt_exp", meta.get("gpt_exp")))
         except Exception as pe:
             print("❌ JSON parse error:", str(pe))
             traceback.print_exc()
@@ -324,7 +381,10 @@ async def evaluate(request: Request):
         cached = find_cached_answer(payload)
         if isinstance(cached, (int, float)):
             print(f"🔁 Already have result for response — key={key} prob={cached:.4f}")
-            return {"probability": float(cached), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
+            resp_out = {"probability": float(cached), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
+            if gpt_exp:
+                resp_out["explain"] = ""
+            return resp_out
 
         # In-flight dedupe (proximity bucket)
         prox_key = inflight_bucket_key(sym, tf, first_bar_dt, bar_sec)
@@ -335,30 +395,53 @@ async def evaluate(request: Request):
                 # Wait up to 5s; afterwards, re-check cache and possibly compute
                 prob = await asyncio.wait_for(fut, timeout=5.0)
                 print(f"🔁 Already have result for response (in-flight reuse) — key={key} prob={prob:.4f}")
-                return {"probability": float(prob), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit_inflight"}
+                resp_out = {"probability": float(prob), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit_inflight"}
+                if gpt_exp:
+                    resp_out["explain"] = ""
+                return resp_out
             except asyncio.TimeoutError:
                 print(f"⏱️ In-flight wait timed out (prox_key={prox_key}); rechecking cache...")
                 cached2 = find_cached_answer(payload)
                 if isinstance(cached2, (int, float)):
                     print(f"🔁 Already have result for response (post-timeout cache) — key={key} prob={cached2:.4f}")
-                    return {"probability": float(cached2), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
+                    resp_out = {"probability": float(cached2), "version": CODE_VERSION, "model": MODEL_NAME, "cache": "hit"}
+                    if gpt_exp:
+                        resp_out["explain"] = ""
+                    return resp_out
                 # proceed as ad-hoc leader
 
         # Leader path — compute with GPT (offload blocking call to a thread)
         compact_json = json.dumps(payload, separators=(",", ":"))
 
-        system_prompt_primary = SYSTEM_PROMPT
+        prompt_return = PROMPT_RETURN_EXPLAIN if gpt_exp else PROMPT_RETURN_PLAIN
+
+        pid = payload.get("pid")
+        pid_label = str(pid or "").strip().lower()
+        system_prompt_primary = (SYSTEM_PROMPT_S2 if pid == "s2" else SYSTEM_PROMPT_m50) + "\n" + prompt_return
+        prompt_label = "S2_PROMPT" if pid_label == "s2" else "SYSTEM_PROMPT_m50"
+        global _PROMPT_SHOWN
+        if _SHOW_PROMPT_ON_START and not _PROMPT_SHOWN:
+            print(f"\n===== {prompt_label} (effective) =====\n{system_prompt_primary}\n===== END {prompt_label} =====\n")
+            _PROMPT_SHOWN = True
+        print(f"Using prompt: {prompt_label} (pid={pid!r}, gpt_exp={gpt_exp})")
         args = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=False)
         try:
             resp = await asyncio.to_thread(auto_heal_and_call, args)
             reply = (resp.choices[0].message.content or "").strip()
-            prob = extract_probability(reply)
+            explain = ""
+            if gpt_exp:
+                prob, explain = extract_prob_and_explain(reply)
+            else:
+                prob = extract_probability(reply)
 
             if prob is None:
-                args_retry = build_args(SYSTEM_PROMPT, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
+                args_retry = build_args(system_prompt_primary, compact_json, max_tok_primary=3, max_tok_retry=6, retry=True)
                 resp2 = await asyncio.to_thread(auto_heal_and_call, args_retry)
                 reply2 = (resp2.choices[0].message.content or "").strip()
-                prob = extract_probability(reply2)
+                if gpt_exp:
+                    prob, explain = extract_prob_and_explain(reply2)
+                else:
+                    prob = extract_probability(reply2)
 
             if prob is None:
                 msg = "Model did not return a numeric probability"
@@ -373,7 +456,10 @@ async def evaluate(request: Request):
             await inflight_finish(prox_key, result=prob)
 
             print(f"✅ Final probability (NEW) — key={stored_key} prob={prob:.4f}")
-            return {"probability": prob, "version": CODE_VERSION, "model": MODEL_NAME, "cache": "miss"}
+            resp_out = {"probability": prob, "version": CODE_VERSION, "model": MODEL_NAME, "cache": "miss"}
+            if gpt_exp:
+                resp_out["explain"] = explain or ""
+            return resp_out
 
         except Exception as e:
             await inflight_finish(prox_key, err=e)
